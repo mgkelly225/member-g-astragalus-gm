@@ -17,6 +17,8 @@ library(geomorph)
 library(Morpho)
 library(MASS)
 library(PCDimension) 
+library(vegan)
+library(patchwork)
 ```
 
 ### Load Scripts for Plotting Code
@@ -53,10 +55,18 @@ summary(GPA_all)
 plot(GPA_all)
 ```
 
+Is there an effect of side?
+```{r}
+# Procrustes ANOVA on shape ~ side in all individuals:
+summary(procD.lm(GPA_all$coords[,,1:136] ~ modern_astragali_info$Side))
+```
+
 ### Principal Components Analysis
+
 PCA using only modern astragali (n = 136). This produces PC axes that are independent of fossil data, so that when using PCs as predictors later (in CVA), the resulting predictions for the fossils are not influenced by the fossils themselves.
+
 ```{r principal components analysis of Procrustes coordinates, include=TRUE}
-# PCA on modern data only (the first 137 specimens in the landmark dataset; also could be defined as anything of dimnames(all_landmarks)[[3]] that begins with "FMNH")
+# PCA on modern data only (the first 136 specimens in the landmark dataset; also could be defined as anything of dimnames(all_landmarks)[[3]] that begins with "FMNH")
 PCA_modern <- gm.prcomp(GPA_all$coords[,,1:136])
 summary(PCA_modern)
 
@@ -78,29 +88,7 @@ pov$brokenStick <- brokenStick(1:nrow(pov),nrow(pov))
 pov <- pov%>%
   mutate(keep = ifelse(brokenStick > prop_variance, 0, 1))%>%
   filter(keep == 1)
-nrow(pov) # this comes up with the first 8 PCs
-```
-
-#### PC1 vs. centroid size
-
-```{r relationship of PC1 to centroid size, echo=FALSE, warning=FALSE, fig.height = 7, fig.width = 9}
-# extract centroid size from GPA 
-modern_astragali_info$centroid_size <- GPA_astragali$Csize
-
-# PC1 vs centroid size
-summary(lm(Comp1 ~ centroid_size, data = modern_astragali_info)) # calculate linear regression between PC1 and centroid size
-
-# plot it
-pc1vCsize <- ggplot(data = astragali_info, aes(x = Comp1, y = centroid_size))+
-  geom_point(aes(shape = Tribe, color = Habitat), size = 3)+
-  tribe_shapes()+
-  scale_color_brewer(palette = "BrBG", direction = -1, labels = c("Forest", "Heavy Cover", "Light Cover", "Open"))+
-  geom_smooth(method = "lm", color = "gray40")+
-  annotate("text", label = "R^2 == 0.46", x = 0.06, y= 33, parse = T)+
-  labs(x = "PC1 (17.7%)", y = "Centroid Size")+
-  theme_classic(base_size = 12)
-
-pc1vCsize
+pov
 ```
 
 #### Figure 2: PC1 vs. PC2 and PC1 vs. PC3
@@ -145,9 +133,9 @@ pc1v3
 3D, color-coded warps of minimum and maximum values along PC1, PC2, and PC3:
 ```{r}
 # generate mesh of mean shape by warping specimen closest to the mean to the mean shape from the GPA
-ref_spec <- mshape(GPA_all$coords[,,1:137]) # find mean shape of modern astragali
-mean_spec <- findMeanSpec(GPA_all$coords[,,1:137]) # actual specimen closest to mean
-mean_filename <- astragali_info$filename[mean_spec] # filename of mean specimen
+ref_spec <- mshape(GPA_all$coords[,,1:136]) # find mean shape of modern astragali
+mean_spec <- findMeanSpec(GPA_all$coords[,,1:136]) # actual specimen closest to mean
+mean_filename <- modern_astragali_info$filename[mean_spec] # filename of mean specimen
 mean_filename <- gsub("\\..*",'', mean_filename) # removes the ".csv" from the end of the filename (removes everything after the period)
 
 # read in .ply file of mean specimen
@@ -198,9 +186,168 @@ warp_pc3_max <- plotRefToTarget(ref_spec, PC3_max, mesh = mean_warp, method = "s
 meshDist(x = warp_pc3_max, mesh2 = mean_warp, rampcolors = c("maroon", "white", "navy"), save = F)
 ```
 
+### Allometry
+
+Replicating some of the methods of Orgebin et al. (2025) to investigate correlation between centroid size and shape overall.
+
+First, generate species mean shapes to investigate this:
+```{r}
+# list of unique species included in the analysis
+species <- unique(modern_astragali_info$Genus_species) 
+
+# blank array to store mean shapes
+mean_shapes <- array(dim = c(20,3,length(species)))
+
+# generate mean shapes
+for (i in 1:length(species)) {
+  who <- species[i] # species
+  ind <- which(modern_astragali_info$Genus_species == who) # which rows correspond to the species in question
+  ids <- modern_astragali_info[ind,]$filename
+  spec_mean_i <- mshape(GPA_all$coords[,,ids]) # mean Procrustes aligned shape of species in question (dimnames in GPA_all match filename column in modern_astragali_info)
+  mean_shapes[,,i] <- spec_mean_i # add mean shape to array
+}
+dimnames(mean_shapes)[[3]] <- species # name them correctly
+
+# extract centroid size from GPA (all individuals)
+modern_astragali_info$centroid_size <- GPA_all$Csize[1:136]
+
+# species data (habitat and mean centroid size)
+species_info <- modern_astragali_info %>% dplyr::select(Genus_species, Habitat, centroid_size) %>%
+  group_by(Genus_species) %>% mutate(mean_centroid_size = mean(centroid_size))
+species_info <- species_info %>% dplyr::select(Genus_species, Habitat, mean_centroid_size) %>% distinct()
+# make sure these rows are in the same order as in GPA coords (they should be, but fix if needed)
+```
+
+##### Procrustes ANOVA (shape ~ centroid size):
+```{r}
+# regress species mean Procrustes shapes against centroid size (log-transformed)
+summary(procD.lm(mean_shapes ~ log(species_info$mean_centroid_size)))
+```
+
+Log centroid size is significantly correlated with astragalus shape overall (but the R-squared value is relatively low, ~0.16). 
+
+##### Variation Partitioning Analysis
+Is size correlated with habitat? Orgebin et al. use a variation partitioning method to explore this (`varpart` function in vegan package).
+```{r}
+# based on the Orgebin et al. (2025) code, to run the variation partitioning analysis, the input data are a 2D array of the Procrustes coordinates, plus corresponding habitat and centroid size data. This is done on species means to account for uneven sampling
+
+# varpart analysis 
+gpa_2d_mod_means <- two.d.array(mean_shapes) #GPA coords of modern bovid species means
+var_part_analysis_means <- varpart(gpa_2d_mod_means, ~species_info$Habitat, ~log(species_info$mean_centroid_size))
+var_part_analysis_means
+summary(var_part_analysis_means)
+```
+The variation partitioning analysis shows that habitat explains 4% of the shape variation, and log(centroid size) explains 12%, with habitat and log(centroid size) jointly explaining 1% of the shape variation in the sample. 
+
+###### Supplementary Figure 1 (variation partitioning analysis):
+```{r}
+# plot Venn diagram from variation partitioning analysis (SOM Figure 1)
+plot(var_part_analysis_means, Xnames=c("Habitat","Size"), cutoff = -Inf)
+```
+
+##### Kruskal-Wallis comparing centroid size among habitat groups
+
+Does centroid size vary among habitat groups?
+```{r}
+# species mean centroid sizes
+sp_mean_sizes <- modern_astragali_info %>% dplyr::select(Genus_species, Habitat, centroid_size) %>%
+  group_by(Genus_species) %>% mutate(mean_centroid_size = mean(centroid_size))
+sp_mean_sizes <- sp_mean_sizes %>% dplyr::select(Genus_species, Habitat, mean_centroid_size) %>% distinct()
+
+# is there a significant difference among groups (Kruskal-Wallis test)
+kruskal.test(x = log(sp_mean_sizes$mean_centroid_size), g = sp_mean_sizes$Habitat)
+```
+
+Examining log species mean centroid sizes (to control for uneven sampling across species), there is no significant difference among habitat groups (p = 0.44).
+
+###### Figure 3: boxplots of centroid size among habitat groups
+```{r}
+# plot
+ggplot(data = sp_mean_sizes) +
+  geom_boxplot(aes(x = Habitat, y = log(mean_centroid_size), fill = Habitat, color = Habitat), alpha = 0.6)+
+  scale_fill_brewer(palette = "BrBG", direction = -1)+
+  scale_color_brewer(palette = "BrBG", direction = -1)+
+  ylab("log(centroid size)")+
+  theme_classic(base_size = 12)+
+  theme(legend.position = "none")
+ggsave("figures/Figure_2.png", width = 7, height = 7)
+```
+
+##### Regressing each PC against centroid size:
+```{r relationship of PCs to log centroid size, include=TRUE}
+# regress centroid size on all PCs and save R^2 values in dataframe
+pc_vs_csize <- list()
+pc_vs_csize_r2 <- data.frame(r2 = integer(), f_stat = integer(), pval_fstat = integer())
+for (i in 1:53) {
+  pc_n <- paste("Comp", i, sep = "")
+  reg <- summary(lm(unlist(modern_astragali_info[,pc_n]) ~ log(modern_astragali_info$centroid_size)))
+  pc_vs_csize[[i]] <- reg # save entire lm output in a list
+  pc_vs_csize_r2[i,"r2"] <- reg$r.squared # extract R^2 value of regression
+  pc_vs_csize_r2[i, "f_stat"] <- reg$fstatistic[1] # extract F-statistic
+  pc_vs_csize_r2[i, "pval_fstat"] <- pf(reg$fstatistic[1], reg$fstatistic[2], reg$fstatistic[3], lower.tail = F) # calculate p-value of F-statistic
+  rownames(pc_vs_csize_r2)[i] <- pc_n
+}
+
+# which PCs have a significant (p < 0.05) correlation with centroid size?
+pc_vs_csize_r2$signif <- pc_vs_csize_r2$pval_fstat < 0.05
+
+# plot PCs that are significantly correlated with centroid size
+# PC1
+pc1vCsize <- ggplot(data = modern_astragali_info, aes(x = Comp1, y = log(centroid_size)))+
+  geom_point(aes(shape = Tribe, color = Habitat), size = 3)+
+  tribe_shapes()+
+  scale_color_brewer(palette = "BrBG", direction = -1, labels = c("Forest", "Heavy Cover", "Light Cover", "Open"))+
+  geom_smooth(method = "lm", color = "gray40")+
+  annotate("text", label = "R^2 == 0.50", x = 0.06, y= 3.5, parse = T)+
+  labs(x = "PC1 (17.2%)", y = "log(Centroid Size)")+
+  theme_classic(base_size = 12)
+
+#PC3
+pc3vCsize <- ggplot(data = modern_astragali_info, aes(x = Comp3, y = log(centroid_size)))+
+  geom_point(aes(shape = Tribe, color = Habitat), size = 3)+
+  tribe_shapes()+
+  scale_color_brewer(palette = "BrBG", direction = -1, labels = c("Forest", "Heavy Cover", "Light Cover", "Open"))+
+  geom_smooth(method = "lm", color = "gray40")+
+  annotate("text", label = "R^2 == 0.067", x = 0.06, y= 3.5, parse = T)+
+  labs(x = "PC3 (7.2%)", y = "log(Centroid Size)")+
+  theme_classic(base_size = 12)
+
+#PC10
+pc10vCsize <- ggplot(data = modern_astragali_info, aes(x = Comp10, y = log(centroid_size)))+
+  geom_point(aes(shape = Tribe, color = Habitat), size = 3)+
+  tribe_shapes()+
+  scale_color_brewer(palette = "BrBG", direction = -1, labels = c("Forest", "Heavy Cover", "Light Cover", "Open"))+
+  geom_smooth(method = "lm", color = "gray40")+
+  annotate("text", label = "R^2 == 0.035", x = 0.04, y= 3.5, parse = T)+
+  labs(x = "PC10 (3.0%)", y = "log(Centroid Size)")+
+  theme_classic(base_size = 12)
+
+#PC12
+pc12vCsize <- ggplot(data = modern_astragali_info, aes(x = Comp12, y = log(centroid_size)))+
+  geom_point(aes(shape = Tribe, color = Habitat), size = 3)+
+  tribe_shapes()+
+  scale_color_brewer(palette = "BrBG", direction = -1, labels = c("Forest", "Heavy Cover", "Light Cover", "Open"))+
+  geom_smooth(method = "lm", color = "gray40")+
+  annotate("text", label = "R^2 == 0.044", x = -0.03, y= 3.5, parse = T)+
+  labs(x = "PC12 (2.5%)", y = "log(Centroid Size)")+
+  theme_classic(base_size = 12)
+
+#PC17
+pc17vCsize <- ggplot(data = modern_astragali_info, aes(x = Comp17, y = log(centroid_size)))+
+  geom_point(aes(shape = Tribe, color = Habitat), size = 3)+
+  tribe_shapes()+
+  scale_color_brewer(palette = "BrBG", direction = -1, labels = c("Forest", "Heavy Cover", "Light Cover", "Open"))+
+  geom_smooth(method = "lm", color = "gray40")+
+  annotate("text", label = "R^2 == 0.065", x = 0.03, y= 3.5, parse = T)+
+  labs(x = "PC17 (1.4%)", y = "log(Centroid Size)")+
+  theme_classic(base_size = 12)
+```
+
 
 ### Canonical Variates Analysis
+
 First, using modern data only to test predictive ability on specimens where we know their habitat. PC scores along each individual axis are scaled between 0 and 1 to allow for clearer interpretation of loadings along CV axes.
+
 ```{r}
 # vector of grouping variable (habitat categories)
 cvagroups <- modern_astragali_info$Habitat
@@ -211,7 +358,40 @@ min_max <- function(x){
   return(res)
 }
 modern_PC_scores_scaled <- apply(mod_PC_scores, 2, min_max) # apply the scaling function to each column of the dataset
+```
 
+
+#### Iterative CVA
+
+What is the influence of increasing the number of PCs one by one on cross-validation success:
+
+```{r iterative CVA}
+iter_cva <- list()
+xvals <- list()
+prop_correct <- data.frame(n_pc = integer(), loo_correct = integer())
+for (i in 2:53) {
+  cva_res <- lda(modern_PC_scores_scaled[,1:i], cvagroups, CV = TRUE)
+  iter_cva[[i-1]] <- cva_res
+  xvals[[i-1]] <- table(cvagroups, cva_res$class)
+  prop_correct[i-1, "n_pc"] <- i
+  prop_correct[i-1, "loo_correct"] <- sum(diag(prop.table(table(cvagroups, cva_res$class))))
+}
+```
+
+##### Supplementary Figure 2: Iterative CVA
+
+Visualise change in LOO cross-validation success across all CVAs:
+```{r plot iterative CVA LOO CV results}
+ggplot(data = prop_correct)+
+  geom_point(aes(x = n_pc, y = loo_correct), color = alpha("black", alpha = 0.8))+
+  geom_smooth(aes(x = n_pc, y = loo_correct), method = "loess", color = "mediumpurple4", fill = alpha("mediumpurple3", alpha = 0.6))+
+  geom_hline(aes(yintercept = max(loo_correct)), linetype = 2)+ # maximum classification success
+  labs(x = "Number of PCs", y = "Leave-one-out cross-validation success rate")+
+  theme_classic()
+```
+
+#### CVA with all PCs:
+```{r}
 # conduct the CVA (without cross-validation) on scaled PC scores:
 cvaresults_scaled <- lda(modern_PC_scores_scaled, cvagroups, CV=FALSE)
 A_scaled <- cvaresults_scaled$scaling # loadings along each CV axis; used to interpret which PCs contribute the most to separation along each axis (Supp. Table 3)
@@ -232,7 +412,7 @@ C_scaled_info <- data.frame(CV1 = C_scaled[,1],
                      Tribe = modern_astragali_info$Tribe)
 ```
 
-#### Leave-one-out cross-validation (Table 1):
+##### Leave-one-out cross-validation (Table 1):
 ```{r}
 cvaresults_scaled_CV <- lda(modern_PC_scores_scaled, cvagroups, CV=TRUE)
 crossval <- table(cvagroups, cvaresults_scaled_CV$class) # confusion matrix of specimen assignments
@@ -262,7 +442,7 @@ species_prediction_performance <- table(cv_predictions$Genus_species, cv_predict
 species_prediction_performance_prop <- prop.table(species_prediction_performance, 1)
 ```
 
-#### Figure 3: CV1 vs. CV2 and CV1 vs. CV3
+##### Figure 4: CV1 vs. CV2 and CV1 vs. CV3
 ```{r, echo = F, fig.width=9.5, fig.height=7}
 # CV1 vs. CV2
 hull_cva_12 <- C_scaled_info %>% group_by(Habitat) %>%
@@ -298,14 +478,15 @@ cva_1v3
 
 #### CVA with first 30 PCs:
 
+The first 30 PCs capture 95% of the sample variance; this is a common cutoff used in geometric morphometric analyses.
 ```{r}
 # conduct the CVA (without cross-validation):
 cvaresults_30pc <- lda(modern_PC_scores_scaled[,1:30], cvagroups, CV=FALSE)
-A_30pc <- cvaresults_30pc$scaling
+A_30pc <- cvaresults_30pc$scaling # Supplementary Table 5
 grpmeans_30pc <- cvaresults_30pc$means
 
 # project specimens onto CVA
-C_30pc <- modern_PC_scores_scaled[,1:30]%*%A_30pc #usually this would be M%*%A
+C_30pc <- modern_PC_scores_scaled[,1:30]%*%A_30pc 
 
 # add specimen info for plotting
 C_30pc_info <- data.frame(CV1 = C_30pc[,1],
@@ -315,10 +496,54 @@ C_30pc_info <- data.frame(CV1 = C_30pc[,1],
                      Tribe = modern_astragali_info$Tribe)
 ```
 
-##### Supplementary Figure 1
+##### Leave-one-out cross-validation (Supplementary Table 6)
+
+```{r}
+cvaresults_30pc_CV <- lda(modern_PC_scores_scaled[,1:30], cvagroups, CV=TRUE)
+crossval_30pc <- table(cvagroups, cvaresults_30pc_CV$class) # confusion matrix of specimen assignments
+sum(diag(prop.table(crossval_30pc))) # total percent correct
+
+# Supplementary Table 4
+altcrossval_30pc <- rbind(crossval_30pc[1,]/sum(crossval_30pc[1,]), crossval_30pc[2,]/sum(crossval_30pc[2,]), crossval_30pc[3,]/sum(crossval_30pc[3,]), crossval_30pc[4,]/sum(crossval_30pc[4,]))
+dimnames(altcrossval_30pc) <- list("Actual"=c("F", "HC", "LC", "O"), "Predicted (CV)"=c("F", "HC", "LC", "O"))
+print(round(altcrossval_30pc, 3))
+```
+
+#### CVA with first 8 PCs (broken stick significant):
+
+```{r}
+# conduct the CVA (without cross-validation):
+cvaresults_8pc <- lda(modern_PC_scores_scaled[,1:8], cvagroups, CV=FALSE)
+A_8pc <- cvaresults_8pc$scaling # Supplementary Table 7
+grpmeans_8pc <- cvaresults_8pc$means
+
+# project specimens onto CVA
+C_8pc <- modern_PC_scores_scaled[,1:8]%*%A_8pc #usually this would be M%*%A
+
+# add specimen info for plotting
+C_8pc_info <- data.frame(CV1 = C_8pc[,1],
+                     CV2 = C_8pc[,2],
+                     CV3 = C_8pc[,3],
+                     Habitat = modern_astragali_info$Habitat,
+                     Tribe = modern_astragali_info$Tribe)
+```
+
+##### Leave-one-out cross-validation (Supplementary Table 8)
+```{r}
+cvaresults_8pc_CV <- lda(modern_PC_scores_scaled[,1:8], cvagroups, CV=TRUE)
+crossval_8pc <- table(cvagroups, cvaresults_8pc_CV$class) # confusion matrix of specimen assignments
+sum(diag(prop.table(crossval_8pc))) # total percent correct
+
+# Supplementary Table 4
+altcrossval_8pc <- rbind(crossval_8pc[1,]/sum(crossval_8pc[1,]), crossval_8pc[2,]/sum(crossval_8pc[2,]), crossval_8pc[3,]/sum(crossval_8pc[3,]), crossval_8pc[4,]/sum(crossval_8pc[4,]))
+dimnames(altcrossval_8pc) <- list("Actual"=c("F", "HC", "LC", "O"), "Predicted (CV)"=c("F", "HC", "LC", "O"))
+print(round(altcrossval_8pc, 3))
+```
+
+#### Supplementary Figure 3 (comparing 30PC vs 8PC CVAs):
 
 ```{r, echo = F, fig.width=9.5, fig.height=7}
-# CV1 vs. CV2
+# CV1 vs. CV2 - 30PC model
 hull_cva_12_30pc <- C_30pc_info %>% group_by(Habitat) %>%
   slice(chull(CV1, CV2))
 cva_1v2_30pc <- ggplot()+
@@ -331,7 +556,7 @@ cva_1v2_30pc <- ggplot()+
   xlab("CV1")+
   ylab("CV2")
 
-# CV1 vs. CV3
+# CV1 vs. CV3 - 30 PC model
 hull_cva_13_30pc <- C_30pc_info %>% group_by(Habitat) %>%
   slice(chull(CV1, CV3))
 cva_1v3_30pc <- ggplot()+
@@ -349,19 +574,182 @@ cva_1v2_30pc
 cva_1v3_30pc
 ```
 
-##### Leave-one-out cross-validation
-```{r}
-cvaresults_30pc_CV <- lda(modern_PC_scores_scaled[,1:30], cvagroups, CV=TRUE)
-crossval_30pc <- table(cvagroups, cvaresults_30pc_CV$class) # confusion matrix of specimen assignments
-sum(diag(prop.table(crossval_30pc))) # total percent correct
+```{r, echo = F, fig.width=9.5, fig.height=7}
+# CV1 vs. CV2 - 8 PC model
+hull_cva_12_8pc <- C_8pc_info %>% group_by(Habitat) %>%
+  slice(chull(CV1, CV2))
+cva_1v2_8pc <- ggplot()+
+  geom_polygon(data = hull_cva_12_8pc, aes(x = CV1, y = CV2, color = Habitat, fill = Habitat), linewidth = 1, alpha = 0.2)+ # plot convex hulls
+  scale_fill_brewer(palette = "BrBG", direction = -1, labels = c("Forest", "Heavy Cover", "Light Cover", "Open"))+
+  geom_point(data = C_8pc_info, mapping = aes(x = CV1, y = CV2, color = Habitat, shape = Tribe), size = 3)+
+  scale_color_brewer(palette = "BrBG", direction = -1, labels = c("Forest", "Heavy Cover", "Light Cover", "Open"))+
+  tribe_shapes() +
+  theme_classic(base_size = 22) +
+  xlab("CV1")+
+  ylab("CV2")
 
-# Supplementary Table 4
-altcrossval_30pc <- rbind(crossval_30pc[1,]/sum(crossval_30pc[1,]), crossval_30pc[2,]/sum(crossval_30pc[2,]), crossval_30pc[3,]/sum(crossval_30pc[3,]), crossval_30pc[4,]/sum(crossval_30pc[4,]))
-dimnames(altcrossval_30pc) <- list("Actual"=c("F", "HC", "LC", "O"), "Predicted (CV)"=c("F", "HC", "LC", "O"))
-print(round(altcrossval_30pc, 3))
+# CV1 vs. CV3 - 8 PC model
+hull_cva_13_8pc <- C_8pc_info %>% group_by(Habitat) %>%
+  slice(chull(CV1, CV3))
+cva_1v3_8pc <- ggplot()+
+  geom_polygon(data = hull_cva_13_8pc, aes(x = CV1, y = CV3, color = Habitat, fill = Habitat), linewidth = 1, alpha = 0.2)+ # plot convex hulls
+  scale_fill_brewer(palette = "BrBG", direction = -1, labels = c("Forest", "Heavy Cover", "Light Cover", "Open"))+
+  geom_point(data = C_8pc_info, mapping = aes(x = CV1, y = CV3, color = Habitat, shape = Tribe), size = 3)+
+  scale_color_brewer(palette = "BrBG", direction = -1, labels = c("Forest", "Heavy Cover", "Light Cover", "Open"))+
+  tribe_shapes() +
+  theme_classic(base_size = 22) +
+  xlab("CV1")+
+  ylab("CV3")
+
+# show plots
+cva_1v2_8pc
+cva_1v3_8pc
 ```
 
-### CVA on fossil specimens
+Combine plots:
+```{r, fig.width=9.5, fig.height=15}
+( (cva_1v2_30pc / cva_1v3_30pc ) | (cva_1v2_8pc / cva_1v3_8pc) ) + plot_layout(guides = "collect")
+```
+
+### Between-group PCA as an alternative to CVA
+
+Mitteroecker & Bookstein (2011) state that in the case where the number of variables exceeds the number of cases, CVA should be avoided in favor of methods that do not require inversion of a covariance matrix, such as between-group PCA.
+```{r}
+# morpho package function
+bg_pca <- groupPCA(dataarray = GPA_all$coords[,,1:136],
+                   groups = cvagroups,
+                   cv = TRUE)
+bg_pca
+```
+
+Are those differences between groups significant? Procrustes ANOVA (shape ~ habitat):
+```{r}
+# regress species mean Procrustes shapes against habitat to identify if group means are significantly different (recommendation of Cardini & Polly 2020)
+summary(procD.lm(mean_shapes ~ species_info$Habitat))
+```
+
+Yes, habitat is significantly associated with species mean shape according to a Procrustes ANOVA. The R2 is 0.13, with a p-value of 0.014. 
+
+#### Figure 5: bgPC1 vs. bgPC2 & bgPC1 vs. bgPC3
+```{r}
+# generate data frame for plotting
+bg_pca_scores <- as.data.frame(bg_pca[["Scores"]])
+bg_pca_scores <- cbind(bg_pca_scores, cvagroups, modern_astragali_info$Tribe)
+colnames(bg_pca_scores) <- c("Dim1", "Dim2", "Dim3", "Habitat", "Tribe")
+
+# plot the scores
+hull_bgpca_12 <- bg_pca_scores %>% group_by(Habitat) %>%
+  slice(chull(Dim1, Dim2))
+bgpca_1v2 <- ggplot() +
+  geom_polygon(data = hull_bgpca_12, aes(x = Dim1, y = Dim2, color = Habitat, fill = Habitat), linewidth = 1, alpha = 0.2)+ 
+  geom_point(data = bg_pca_scores, aes(x = Dim1, y = Dim2, color = Habitat, shape = Tribe), size = 3)+
+  scale_color_brewer(palette = "BrBG", direction = -1)+
+  scale_fill_brewer(palette = "BrBG", direction = -1)+
+  tribe_shapes()+
+  xlab("between-group PC1 (74.9%)")+
+  ylab("between-group PC2 (14.2%)")+
+  theme_classic(base_size = 22)
+
+hull_bgpca_13 <- bg_pca_scores %>% group_by(Habitat) %>%
+  slice(chull(Dim1, Dim3))
+bgpca_1v3 <- ggplot() +
+  geom_polygon(data = hull_bgpca_13, aes(x = Dim1, y = Dim3, color = Habitat, fill = Habitat), linewidth = 1, alpha = 0.2)+ 
+  geom_point(data = bg_pca_scores, aes(x = Dim1, y = Dim3, color = Habitat, shape = Tribe), size = 3)+
+  scale_color_brewer(palette = "BrBG", direction = -1)+
+  scale_fill_brewer(palette = "BrBG", direction = -1)+
+  tribe_shapes()+
+  xlab("between-group PC1 (74.9%)")+
+  ylab("between-group PC3 (10.9%)")+
+  theme_classic(base_size = 22)
+
+hull_bgpca_23 <- bg_pca_scores %>% group_by(Habitat) %>%
+  slice(chull(Dim2, Dim3))
+bgpca_2v3 <- ggplot() +
+  geom_polygon(data = hull_bgpca_23, aes(x = Dim2, y = Dim3, color = Habitat, fill = Habitat), linewidth = 1, alpha = 0.2)+ 
+  geom_point(data = bg_pca_scores, aes(x = Dim2, y = Dim3, color = Habitat, shape = Tribe), size = 3)+
+  scale_color_brewer(palette = "BrBG", direction = -1)+
+  scale_fill_brewer(palette = "BrBG", direction = -1)+
+  tribe_shapes()+
+  xlab("between-group PC2 (14.2%)")+
+  ylab("between-group PC3 (10.9%)")+
+  theme_classic(base_size = 22)
+```
+
+```{r, fig.height=6, fig.width=8}
+(bgpca_1v2 / bgpca_1v3) + plot_layout(guides = "collect") & theme(legend.position = "bottom")
+```
+
+#### Figure 6: warps of max and min values along bgPC axes
+
+```{r}
+# generate mesh of mean shape by warping specimen closest to the mean to the mean shape from the GPA
+ref_spec <- mshape(GPA_all$coords[,,1:136]) # find mean shape of modern astragali
+mean_spec <- findMeanSpec(GPA_all$coords[,,1:136]) # actual specimen closest to mean
+mean_filename <- modern_astragali_info$filename[mean_spec] # filename of mean specimen
+mean_filename <- gsub("\\..*",'', mean_filename) # removes the ".csv" from the end of the filename (removes everything after the period)
+
+# read in .ply file of mean specimen
+mean_mesh <- read.ply(file = paste("data/",mean_filename,".ply", sep = ""), ShowSpecimen = TRUE)
+
+# non-Procrustes landmarks for actual specimen closest to the mean
+mean_landmarks <- all_landmarks[,,mean_spec]
+
+# warp real specimen closest to the mean to the mean shape
+mean_warp <- warpRefMesh(mesh = mean_mesh, mesh.coord = mean_landmarks, ref = ref_spec, centered = F)
+plot3d(mean_warp, aspect = F) 
+
+# get landmarks from max and min along each bg-PC
+bgPC1_max <- restoreShapes(scores = max(bg_pca$Scores[,1]), PC = bg_pca$groupPCs[,1], mshape = ref_spec)
+bgPC1_min <- restoreShapes(scores = min(bg_pca$Scores[,1]), PC = bg_pca$groupPCs[,1], mshape = ref_spec)
+
+bgPC2_max <- restoreShapes(scores = max(bg_pca$Scores[,2]), PC = bg_pca$groupPCs[,2], mshape = ref_spec)
+bgPC2_min <- restoreShapes(scores = min(bg_pca$Scores[,2]), PC = bg_pca$groupPCs[,2], mshape = ref_spec)
+
+bgPC3_max <- restoreShapes(scores = max(bg_pca$Scores[,3]), PC = bg_pca$groupPCs[,3], mshape = ref_spec)
+bgPC3_min <- restoreShapes(scores = min(bg_pca$Scores[,3]), PC = bg_pca$groupPCs[,3], mshape = ref_spec)
+
+# bgPC1 max warp 
+warp_bgpc1_max <- plotRefToTarget(ref_spec, bgPC1_max, mesh = mean_warp, method = "surface")
+meshDist(x = warp_bgpc1_max, mesh2 = mean_warp, rampcolors = c("maroon", "white", "navy"), save = F)
+# bgPC1 min warp 
+warp_bgpc1_min <- plotRefToTarget(ref_spec, bgPC1_min, mesh = mean_warp, method = "surface")
+meshDist(x = warp_bgpc1_min, mesh2 = mean_warp, rampcolors = c("maroon", "white", "navy"), save = F)
+
+# bgPC2 max warp 
+warp_bgpc2_max <- plotRefToTarget(ref_spec, bgPC2_max, mesh = mean_warp, method = "surface")
+meshDist(x = warp_bgpc2_max, mesh2 = mean_warp, rampcolors = c("maroon", "white", "navy"), save = F)
+# bgPC2 min warp 
+warp_bgpc2_min <- plotRefToTarget(ref_spec, bgPC2_min, mesh = mean_warp, method = "surface")
+meshDist(x = warp_bgpc2_min, mesh2 = mean_warp, rampcolors = c("maroon", "white", "navy"), save = F)
+
+# bgPC3 max warp 
+warp_bgpc3_max <- plotRefToTarget(ref_spec, bgPC3_max, mesh = mean_warp, method = "surface")
+meshDist(x = warp_bgpc3_max, mesh2 = mean_warp, rampcolors = c("maroon", "white", "navy"), save = F)
+# bgPC3 min warp 
+warp_bgpc3_min <- plotRefToTarget(ref_spec, bgPC3_min, mesh = mean_warp, method = "surface")
+meshDist(x = warp_bgpc3_min, mesh2 = mean_warp, rampcolors = c("maroon", "white", "navy"), save = F)
+```
+
+#### Misclassifications within the modern sample:
+```{r}
+bgpca_predictions <- classify(bg_pca, cv=T)
+bgpca_predictions <- bgpca_predictions$class
+bgpca_predictions <- bind_cols(modern_astragali_info[,c("Tribe", "Genus_species", "Habitat")], bgpca_predictions)
+colnames(bgpca_predictions)[4] <- "pred_habitat"
+
+# which predictions are correct (TRUE) versus incorrect (FALSE)
+bgpca_predictions$match <- (bgpca_predictions$Habitat == bgpca_predictions$pred_habitat)
+
+# proportions of correct (TRUE) and incorrect (FALSE) classifications by tribe
+tribe_prediction_performance_bgpca <- table(bgpca_predictions$Tribe, bgpca_predictions$match)
+tribe_prediction_performance_prop_bgpca <- prop.table(tribe_prediction_performance_bgpca, 1)
+
+# proportions of correct (TRUE) and incorrect (FALSE) classifications by species
+species_prediction_performance_bgpca <- table(bgpca_predictions$Genus_species, bgpca_predictions$match)
+species_prediction_performance_prop_bgpca <- prop.table(species_prediction_performance_bgpca, 1)
+```
+
+### Predict fossils using CVA
 
 First, project fossil Procrustes coordinates into PC space generated from modern data:
 ```{r}
@@ -435,10 +823,119 @@ fossil_scores_info %>% group_by(Submember_2, likely_category) %>%
   tally()
 ```
 
-#### Plot results: habitats through time
-Generate barplots showing the distribution of habitats through time:
+Repeat this with the CVA using the first 30PCs:
+```{r}
+# conduct the CVA (without cross-validation) on the first 30 un-scaled PC scores:
+cvaresults_30pc <- lda(mod_PC_scores[,1:30], cvagroups, CV=FALSE)
+A_30pc <- cvaresults_30pc$scaling
+grpmeans_30pc <- cvaresults_30pc$means
 
-##### Figure 4: Lower vs. Upper G
+# project modern specimens onto CVA
+C_30pc <- mod_PC_scores[,1:30]%*%A_30pc
+
+# add specimen info to CV scores for plotting
+C_modern_30pc <- data.frame(CV1 = C_30pc[,1],
+                     CV2 = C_30pc[,2],
+                     CV3 = C_30pc[,3],
+                     Habitat = modern_astragali_info$Habitat,
+                     Tribe = modern_astragali_info$Tribe)
+
+# predict fossil scores
+C_fossil_30pc <- predict(cvaresults_30pc, newdata = fossil_pc_scores[,1:30])
+fossil_scores_30pc <- C_fossil_30pc$x # CV scores for all fossils
+post_prob_fossils_30pc<- C_fossil_30pc$posterior # probabilities of group membership
+
+# make this easier to visualize
+C_modern_info_30pc <- data.frame(CV1 = C_modern_30pc[,1],
+                     CV2 = C_modern_30pc[,2],
+                     CV3 = C_modern_30pc[,3],
+                     Habitat = modern_astragali_info$Habitat,
+                     Tribe = modern_astragali_info$Tribe,
+                     Specimen = modern_astragali_info$Spec.number)
+fossil_scores_info_30pc <- data.frame(CV1 = fossil_scores_30pc[,1],
+                            CV2 = fossil_scores_30pc[,2],
+                            CV3 = fossil_scores_30pc[,3],
+                            Locality = fossil_astragali_info$Community, 
+                            Tribe = "Fossil",
+                            Specimen = fossil_astragali_info$Spec.number,
+                            Submember = fossil_astragali_info$submember,
+                            Submember_2 = fossil_astragali_info$submember_2)
+
+fossil_scores_info_30pc <- bind_cols(fossil_scores_info_30pc, post_prob_fossils_30pc)
+
+# record the category that the CVA predicted as most likely for each individual
+fossil_scores_info_30pc$likely_category <- NA
+fossil_scores_info_30pc$likely_category <- colnames(fossil_scores_info_30pc[,9:12])[apply(fossil_scores_info_30pc[,9:12], 1, which.max)]
+
+fossil_scores_info_30pc %>% group_by(Submember_2, likely_category) %>%
+  tally()
+```
+
+Repeat this with the CVA using PCs 1-8 only:
+```{r}
+# conduct the CVA (without cross-validation) on the first 8 un-scaled PC scores:
+cvaresults_8pc <- lda(mod_PC_scores[,1:8], cvagroups, CV=FALSE)
+A_8pc <- cvaresults_8pc$scaling
+grpmeans_8pc <- cvaresults_8pc$means
+
+# project modern specimens onto CVA
+C_8pc <- mod_PC_scores[,1:8]%*%A_8pc
+
+# add specimen info to CV scores for plotting
+C_modern_8pc <- data.frame(CV1 = C_8pc[,1],
+                     CV2 = C_8pc[,2],
+                     CV3 = C_8pc[,3],
+                     Habitat = modern_astragali_info$Habitat,
+                     Tribe = modern_astragali_info$Tribe)
+
+# predict fossil scores
+C_fossil_8pc <- predict(cvaresults_8pc, newdata = fossil_pc_scores[,1:8])
+fossil_scores_8pc <- C_fossil_8pc$x # CV scores for all fossils
+post_prob_fossils_8pc<- C_fossil_8pc$posterior # probabilities of group membership
+
+# make this easier to visualize
+C_modern_info_8pc <- data.frame(CV1 = C_modern_8pc[,1],
+                     CV2 = C_modern_8pc[,2],
+                     CV3 = C_modern_8pc[,3],
+                     Habitat = modern_astragali_info$Habitat,
+                     Tribe = modern_astragali_info$Tribe,
+                     Specimen = modern_astragali_info$Spec.number)
+fossil_scores_info_8pc <- data.frame(CV1 = fossil_scores_8pc[,1],
+                            CV2 = fossil_scores_8pc[,2],
+                            CV3 = fossil_scores_8pc[,3],
+                            Locality = fossil_astragali_info$Community, 
+                            Tribe = "Fossil",
+                            Specimen = fossil_astragali_info$Spec.number,
+                            Submember = fossil_astragali_info$submember,
+                            Submember_2 = fossil_astragali_info$submember_2)
+
+fossil_scores_info_8pc <- bind_cols(fossil_scores_info_8pc, post_prob_fossils_8pc)
+
+# record the category that the DFA predicted as most likely for each individual
+fossil_scores_info_8pc$likely_category <- NA
+fossil_scores_info_8pc$likely_category <- colnames(fossil_scores_info_8pc[,9:12])[apply(fossil_scores_info_8pc[,9:12], 1, which.max)]
+
+fossil_scores_info_8pc %>% group_by(Submember_2, likely_category) %>%
+  tally()
+```
+
+### Predict fossils using the bgPCA
+```{r}
+# project fossils onto the bgPCA space
+bg_pca_pred <- as.data.frame(predict(bg_pca, newdata = GPA_all$coords[,,137:dim(GPA_all$coords)[3]])) 
+colnames(bg_pca_pred) <- c("Dim1", "Dim2", "Dim3")
+
+# classify fossils using cross-validated bgPCA
+bg_pca_classif <- classify(bg_pca, newdata = GPA_all$coords[,,137:dim(GPA_all$coords)[3]], cv = TRUE)
+
+# generate dataframe for plotting
+fossil_scores_bgpca <- bind_cols(bg_pca_pred, fossil_astragali_info[c("Spec.number", "Community", "submember", "submember_2")])
+fossil_scores_bgpca$pred_habitat <- bg_pca_classif$class
+```
+
+### Figure 7: Lower vs. Upper G
+
+CVA using all 53 PCs:
 ```{r, fig.width = 10.5, fig.height = 7}
 # delineate upper versus lower G in dataset
 fossil_scores_info$lower <- NA
@@ -463,11 +960,194 @@ upper_v_lower_plot <- fossil_scores_info %>% group_by(lower, likely_category) %>
   annotate(geom = "text", x = c(1.03, 1.03), y = c(1,2), label = c("n =\n164", "n =\n31"), hjust = 0.2, size = 5)+
   theme_classic(base_size = 22)+
   theme(legend.position = "bottom", axis.text.y = element_text(hjust = 0.5))
-ggsave(filename = "~/Desktop/UChicago/Dissertation/chapter_3/figures/upper_v_lower_plot.png", width = 10.5, height = 7)
 upper_v_lower_plot
 ```
 
-##### Figure 5: Well-sampled and narrowly temporally constrained intervals
+bgPCA predictions:
+```{r,fig.width = 10.5, fig.height = 7}
+# delineate upper versus lower G in dataset
+fossil_scores_bgpca$lower <- NA
+fossil_scores_bgpca[fossil_scores_bgpca$submember %in% c("G-15","G-19","G-24","G-27","G-28"),]$lower <- F # upper G
+fossil_scores_bgpca[!fossil_scores_bgpca$submember %in% c("G-15","G-19","G-24","G-27","G-28"),]$lower <- T # lower G
+
+# chi-square to test for significant differences in habitat categories between upper and lower G
+upper_v_lower_bgpca <- table(fossil_scores_bgpca$lower, fossil_scores_bgpca$pred_habitat)
+dimnames(upper_v_lower_bgpca)[[1]] <- c("upper", "lower")
+set.seed(1212)
+chisq.test(upper_v_lower_bgpca, simulate.p.value = T)
+
+# upper versus lower G (G1-13 versus G15-29) -- this plot includes everything
+upper_v_lower_plot_bgpca <- fossil_scores_bgpca %>% group_by(lower, pred_habitat) %>% tally() %>%
+  ggplot()+
+  geom_col(aes(x = n, y = lower, fill = pred_habitat), position = "fill")+
+  scale_fill_brewer(palette = "BrBG", direction = -1, name = "Predicted category")+
+  scale_y_discrete(limits = rev, labels = c("G-1-13\n2.26 -\n2.08 Ma", "G-15-29\n2.07 -\n1.92 Ma"))+
+  theme_classic(base_size = 16)+
+  xlab("Proportion of specimens")+
+  ylab(NULL)+
+  annotate(geom = "text", x = c(1.03, 1.03), y = c(1,2), label = c("n =\n164", "n =\n31"), hjust = 0.2, size = 5)+
+  theme_classic(base_size = 22)+
+  theme(legend.position = "bottom", axis.text.y = element_text(hjust = 0.5))
+
+upper_v_lower_plot_bgpca
+```
+
+Combine the two plots:
+```{r, fig.height=12, fig.width=10.5}
+upper_v_lower_plot / upper_v_lower_plot_bgpca + plot_layout(guides = "collect", axis_titles = "collect_x") & theme(legend.position = "bottom")
+```
+
+### Supplementary Figure 4: CVAs using 30 PCs and 8PCs, Lower vs. Upper G
+
+CVA using 30 PCs:
+```{r, fig.width = 10.5, fig.height = 7}
+# delineate upper versus lower G in dataset
+fossil_scores_info_30pc$lower <- NA
+fossil_scores_info_30pc[fossil_scores_info_30pc$Submember %in% c("G-15","G-19","G-24","G-27","G-28"),]$lower <- F # upper G
+fossil_scores_info_30pc[!fossil_scores_info_30pc$Submember %in% c("G-15","G-19","G-24","G-27","G-28"),]$lower <- T # lower G
+
+# chi-square to test for significant differences in habitat categories between upper and lower G
+upper_v_lower_30pc <- table(fossil_scores_info_30pc$lower, fossil_scores_info_30pc$likely_category)
+dimnames(upper_v_lower_30pc)[[1]] <- c("upper", "lower")
+set.seed(1212)
+chisq.test(upper_v_lower_30pc, simulate.p.value = T)
+
+# upper versus lower G (G1-13 versus G15-29) -- this plot includes everything
+upper_v_lower_plot_30pc <- fossil_scores_info_30pc %>% group_by(lower, likely_category) %>% tally() %>%
+  ggplot()+
+  geom_col(aes(x = n, y = lower, fill = likely_category), position = "fill")+
+  scale_fill_brewer(palette = "BrBG", direction = -1, name = "Predicted category")+
+  scale_y_discrete(limits = rev, labels = c("G-1-13\n2.26 -\n2.08 Ma", "G-15-29\n2.07 -\n1.92 Ma"))+
+  theme_classic(base_size = 16)+
+  xlab("Proportion of specimens")+
+  ylab(NULL)+
+  annotate(geom = "text", x = c(1.03, 1.03), y = c(1,2), label = c("n =\n164", "n =\n31"), hjust = 0.2, size = 5)+
+  theme_classic(base_size = 22)+
+  theme(legend.position = "bottom", axis.text.y = element_text(hjust = 0.5))
+upper_v_lower_plot_30pc
+```
+
+CVA using 8 PCs:
+```{r, fig.width = 10.5, fig.height = 7}
+# delineate upper versus lower G in dataset
+fossil_scores_info_8pc$lower <- NA
+fossil_scores_info_8pc[fossil_scores_info_8pc$Submember %in% c("G-15","G-19","G-24","G-27","G-28"),]$lower <- F # upper G
+fossil_scores_info_8pc[!fossil_scores_info_8pc$Submember %in% c("G-15","G-19","G-24","G-27","G-28"),]$lower <- T # lower G
+
+# chi-square to test for significant differences in habitat categories between upper and lower G
+upper_v_lower_8pc <- table(fossil_scores_info_8pc$lower, fossil_scores_info_8pc$likely_category)
+dimnames(upper_v_lower_8pc)[[1]] <- c("upper", "lower")
+set.seed(1212)
+chisq.test(upper_v_lower_8pc, simulate.p.value = T)
+
+# upper versus lower G (G1-13 versus G15-29) -- this plot includes everything
+upper_v_lower_plot_8pc <- fossil_scores_info_8pc %>% group_by(lower, likely_category) %>% tally() %>%
+  ggplot()+
+  geom_col(aes(x = n, y = lower, fill = likely_category), position = "fill")+
+  scale_fill_brewer(palette = "BrBG", direction = -1, name = "Predicted category")+
+  scale_y_discrete(limits = rev, labels = c("G-1-13\n2.26 -\n2.08 Ma", "G-15-29\n2.07 -\n1.92 Ma"))+
+  theme_classic(base_size = 16)+
+  xlab("Proportion of specimens")+
+  ylab(NULL)+
+  annotate(geom = "text", x = c(1.03, 1.03), y = c(1,2), label = c("n =\n164", "n =\n31"), hjust = 0.2, size = 5)+
+  theme_classic(base_size = 22)+
+  theme(legend.position = "bottom", axis.text.y = element_text(hjust = 0.5))
+upper_v_lower_plot_8pc
+```
+
+Combine plots:
+```{r, fig.height=12, fig.width=8}
+upper_v_lower_plot_30pc / upper_v_lower_plot_8pc +
+  plot_layout(guides = "collect", axis_titles = "collect_x" ) & theme(legend.position = "bottom")
+```
+
+### Supplementary Figure 5: All submembers, CVA vs bgPCA
+Showing all of the sub-members, even ones with wide temporal ranges (e.g., G-1-9) and ones represented by 2 or fewer fossils. Supplementary Figure 5 is the CVA with all PCs versus the bgPCA predictions. 
+
+CVA with all PCs:
+```{r, fig.width = 9, fig.height = 11}
+# plot everything with the most detailed sub-member info
+sample_sizes <- as.vector(fossil_scores_info %>% group_by(Submember_2) %>% tally())
+sample_sizes <- sample_sizes[["n"]]
+sample_sizes <- paste("n =", sample_sizes)
+
+submember_2_plot <- fossil_scores_info %>% group_by(Submember_2, likely_category) %>% tally() %>%
+  ggplot()+
+  geom_col(aes(x = n, y = Submember_2, fill = likely_category), position = "fill")+
+  scale_fill_brewer(palette = "BrBG", direction = -1, name = "Predicted category")+
+  theme_classic(base_size = 16)+
+  xlab("Proportion of specimens")+
+  ylab("Submember")+
+  annotate(geom = "text", x = 1.03, y = as.vector(1:length(sample_sizes)), label = sample_sizes, hjust = 0.2, size = 4)+
+  theme(legend.position = "bottom")
+
+submember_2_plot
+```
+
+bgPCA predictions:
+```{r, fig.width = 9, fig.height = 11}
+# plot everything with the most detailed sub-member info
+submember_2_plot_bgpca <- fossil_scores_bgpca %>% group_by(submember_2, pred_habitat) %>% tally() %>%
+  ggplot()+
+  geom_col(aes(x = n, y = submember_2, fill = pred_habitat), position = "fill")+
+  scale_fill_brewer(palette = "BrBG", direction = -1, name = "Predicted category")+
+  theme_classic(base_size = 16)+
+  xlab("Proportion of specimens")+
+  ylab("Submember")+
+  annotate(geom = "text", x = 1.03, y = as.vector(1:length(sample_sizes)), label = sample_sizes, hjust = 0.2, size = 4)+
+  theme(legend.position = "bottom")
+
+submember_2_plot_bgpca
+```
+
+Combine plots:
+```{r, fig.height=10, fig.width=18}
+(submember_2_plot | submember_2_plot_bgpca) + plot_layout(axis_titles = "collect", axes = "collect_y", guides = "collect") & theme(legend.position = "bottom") 
+```
+
+### Supplementary Figure 6: All submembers, 30 PC CVA vs 8 PC CVA
+Same as Supplementary Figure 5, but for the CVAs using 30 PCs and 8 PCs.
+
+30 PC CVA predictions:
+```{r, fig.width = 9, fig.height = 11}
+submember_2_plot_30pc <- fossil_scores_info_30pc %>% group_by(Submember_2, likely_category) %>% tally() %>%
+  ggplot()+
+  geom_col(aes(x = n, y = Submember_2, fill = likely_category), position = "fill")+
+  scale_fill_brewer(palette = "BrBG", direction = -1, name = "Predicted category")+
+  theme_classic(base_size = 16)+
+  xlab("Proportion of specimens")+
+  ylab("Submember")+
+  annotate(geom = "text", x = 1.03, y = as.vector(1:length(sample_sizes)), label = sample_sizes, hjust = 0.2, size = 4)+
+  theme(legend.position = "bottom")
+
+submember_2_plot_30pc
+```
+
+8 PC CVA predictions:
+```{r, fig.width = 9, fig.height = 11}
+submember_2_plot_8pc <- fossil_scores_info_8pc %>% group_by(Submember_2, likely_category) %>% tally() %>%
+  ggplot()+
+  geom_col(aes(x = n, y = Submember_2, fill = likely_category), position = "fill")+
+  scale_fill_brewer(palette = "BrBG", direction = -1, name = "Predicted category")+
+  theme_classic(base_size = 16)+
+  xlab("Proportion of specimens")+
+  ylab("Submember")+
+  annotate(geom = "text", x = 1.03, y = as.vector(1:length(sample_sizes)), label = sample_sizes, hjust = 0.2, size = 4)+
+  theme(legend.position = "bottom")
+
+submember_2_plot_8pc
+```
+
+Combine plots:
+```{r fig.height=12, fig.width=18}
+(submember_2_plot_30pc | submember_2_plot_8pc) + plot_layout(axis_titles = "collect", axes = "collect_y", guides = "collect") & theme(legend.position = "bottom") 
+``` 
+
+### Figure 8: Well-sampled and narrowly temporally constrained intervals
+
+Main text figure 8 includes only the CVA using all PCs and the bgPCA.
+
+Predictions from CVA using all PCs:
 ```{r, fig.width = 9, fig.height = 9}
 # reorder factor levels so that the submembers are in chronological order from oldest to youngest
 fossil_scores_info$Submember <- as.factor(fossil_scores_info$Submember)
@@ -508,31 +1188,140 @@ submember_plot_clean <- fossil_scores_info %>% filter(plotting %in% c("G-3", "G-
   ylab("Submember")+
   annotate(geom = "text", x = 1.03, y = as.vector(1:(length(subset_samples))), label = subset_samples, hjust = 0.2, size = 4)+
   theme(legend.position = "bottom")
-ggsave(filename = "~/Desktop/UChicago/Dissertation/chapter_3/figures/submember_plot_clean.png", width = 9, height = 9)
 
 submember_plot_clean
 ```
 
-##### Supplementary Figure 2
-Showing all of the sub-members, even ones with wide temporal ranges (e.g., G-1-9) and ones represented by 2 or fewer fossils.
+Predictions from bgPCA:
+```{r, fig.width = 9, fig.height = 9}
+# reorder factor levels so that the submembers are in chronological order from oldest to youngest
+fossil_scores_bgpca$submember <- as.factor(fossil_scores_bgpca$submember)
+levels(fossil_scores_bgpca$submember)
+fossil_scores_bgpca$submember <- factor(fossil_scores_bgpca$submember, levels = c("G-1","G-2","G-3","G-4","G-5","G-6","G-7","G-8","G-9","G-10","G-11","G-12","G-13","G-15","G-19","G-24","G-27","G-28"))
 
-```{r, fig.width = 9, fig.height = 11}
-# plot everything with the most detailed sub-member info
-sample_sizes <- as.vector(fossil_scores_info %>% group_by(Submember_2) %>% tally())
-sample_sizes <- sample_sizes[["n"]]
-sample_sizes <- paste("n =", sample_sizes)
+fossil_scores_bgpca$submember_2 <- as.factor(fossil_scores_bgpca$submember_2)
+levels(fossil_scores_bgpca$submember_2)
+fossil_scores_bgpca$submember_2 <- factor(fossil_scores_bgpca$submember_2, levels = c("G-1", "G-1-5", "G-1-9", "G-1-13", "G-3", "G-3-8", "G-3-13", "G-4", "G-4-13", "G-5", "G-6", "G-6-8", "G-7", "G-7-8", "G-8", "G-8-9", "G-9", "G-10-11", "G-11", "G-12", "G-12-13", "G-13", "G-15", "G-15-29", "G-19", "G-19-20", "G-24", "G-27", "G-27-28", "G-28-29"))
 
-submember_2_plot <- fossil_scores_info %>% group_by(Submember_2, likely_category) %>% tally() %>%
+# only n > 2 and combining some groups (adjacent sub-members) 
+fossil_scores_bgpca$plotting <- NA
+fossil_scores_bgpca$plotting <- fossil_scores_bgpca$submember_2
+fossil_scores_bgpca[fossil_scores_bgpca$plotting %in% c("G-27", "G-27-28"),]$plotting <- "G-27-28"
+fossil_scores_bgpca[fossil_scores_bgpca$plotting %in% c("G-19", "G-19-20"),]$plotting <- "G-19-20"
+fossil_scores_bgpca[fossil_scores_bgpca$plotting %in% c("G-10-11", "G-11"),]$plotting <- "G-10-11"
+fossil_scores_bgpca[fossil_scores_bgpca$plotting %in% c("G-8-9", "G-9"),]$plotting <- "G-8-9"
+
+# chi-squared
+subset_bgpca <- fossil_scores_bgpca %>% filter(plotting %in% c("G-3", "G-4", "G-5", "G-7", "G-8", "G-8-9", "G-10-11", "G-12", "G-12-13", "G-13", "G-19-20", "G-27-28", "G-28-29")) 
+subset_bgpca$plotting <- factor(subset_bgpca$plotting, levels = c("G-3", "G-4", "G-5", "G-7", "G-8", "G-8-9", "G-10-11", "G-12", "G-12-13", "G-13", "G-19-20", "G-27-28", "G-28-29"))
+subset_bgpca <- table(subset_bgpca$plotting, subset_bgpca$pred_habitat)
+set.seed(1212)
+chisq.test(subset_bgpca, simulate.p.value = T)
+
+# plot
+submember_plot_clean_bgpca <- fossil_scores_bgpca %>% filter(plotting %in% c("G-3", "G-4", "G-5", "G-7", "G-8", "G-8-9", "G-10-11", "G-12", "G-12-13", "G-13", "G-19-20", "G-27-28", "G-28-29")) %>% group_by(plotting, pred_habitat) %>% tally() %>%
   ggplot()+
-  geom_col(aes(x = n, y = Submember_2, fill = likely_category), position = "fill")+
+  geom_col(aes(x = n, y = plotting, fill = pred_habitat), position = "fill")+
   scale_fill_brewer(palette = "BrBG", direction = -1, name = "Predicted category")+
   theme_classic(base_size = 16)+
   xlab("Proportion of specimens")+
   ylab("Submember")+
-  annotate(geom = "text", x = 1.03, y = as.vector(1:length(sample_sizes)), label = sample_sizes, hjust = 0.2, size = 4)+
+  annotate(geom = "text", x = 1.03, y = as.vector(1:(length(subset_samples))), label = subset_samples, hjust = 0.2, size = 4)+
   theme(legend.position = "bottom")
-ggsave(filename = "~/Desktop/UChicago/Dissertation/chapter_3/figures/submember_2_plot.png", width = 9, height = 11)
 
-submember_2_plot
+submember_plot_clean_bgpca
 ```
 
+Compare to CVA with full shape:
+```{r, fig.height=9, fig.width=18}
+(submember_plot_clean | submember_plot_clean_bgpca) + plot_layout(axis_titles = "collect", axes = "collect_y", guides = "collect") & theme(legend.position = "bottom") 
+```
+
+
+### Supplementary Figure 7: well-sampled and narrow temporal intervals, 30 PC vs 8 PC CVAs
+Well-sampled and better temporally constrained intervals for the 30 PC and 8 PC CVAs.
+
+Predictions from 30 PC CVA:
+```{r, fig.width = 9, fig.height = 9}
+# reorder factor levels so that the submembers are in chronological order from oldest to youngest
+fossil_scores_info_30pc$Submember <- as.factor(fossil_scores_info_30pc$Submember)
+levels(fossil_scores_info_30pc$Submember)
+fossil_scores_info_30pc$Submember <- factor(fossil_scores_info_30pc$Submember, levels = c("G-1","G-2","G-3","G-4","G-5","G-6","G-7","G-8","G-9","G-10","G-11","G-12","G-13","G-15","G-19","G-24","G-27","G-28"))
+
+fossil_scores_info_30pc$Submember_2 <- as.factor(fossil_scores_info_30pc$Submember_2)
+levels(fossil_scores_info_30pc$Submember_2)
+fossil_scores_info_30pc$Submember_2 <- factor(fossil_scores_info_30pc$Submember_2, levels = c("G-1", "G-1-5", "G-1-9", "G-1-13", "G-3", "G-3-8", "G-3-13", "G-4", "G-4-13", "G-5", "G-6", "G-6-8", "G-7", "G-7-8", "G-8", "G-8-9", "G-9", "G-10-11", "G-11", "G-12", "G-12-13", "G-13", "G-15", "G-15-29", "G-19", "G-19-20", "G-24", "G-27", "G-27-28", "G-28-29"))
+
+# only n > 2 and combining some groups (adjacent sub-members) 
+fossil_scores_info_30pc$plotting <- NA
+fossil_scores_info_30pc$plotting <- fossil_scores_info_30pc$Submember_2
+fossil_scores_info_30pc[fossil_scores_info_30pc$plotting %in% c("G-27", "G-27-28"),]$plotting <- "G-27-28"
+fossil_scores_info_30pc[fossil_scores_info_30pc$plotting %in% c("G-19", "G-19-20"),]$plotting <- "G-19-20"
+fossil_scores_info_30pc[fossil_scores_info_30pc$plotting %in% c("G-10-11", "G-11"),]$plotting <- "G-10-11"
+fossil_scores_info_30pc[fossil_scores_info_30pc$plotting %in% c("G-8-9", "G-9"),]$plotting <- "G-8-9"
+
+# chi-squared
+subset_30pc <- fossil_scores_info_30pc %>% filter(plotting %in% c("G-3", "G-4", "G-5", "G-7", "G-8", "G-8-9", "G-10-11", "G-12", "G-12-13", "G-13", "G-19-20", "G-27-28", "G-28-29")) 
+subset_30pc$plotting <- factor(subset_30pc$plotting, levels = c("G-3", "G-4", "G-5", "G-7", "G-8", "G-8-9", "G-10-11", "G-12", "G-12-13", "G-13", "G-19-20", "G-27-28", "G-28-29"))
+subset_30pc <- table(subset_30pc$plotting, subset_30pc$likely_category)
+set.seed(1212)
+chisq.test(subset_30pc, simulate.p.value = T)
+
+# plot
+submember_plot_clean_30pc <- fossil_scores_info_30pc %>% filter(plotting %in% c("G-3", "G-4", "G-5", "G-7", "G-8", "G-8-9", "G-10-11", "G-12", "G-12-13", "G-13", "G-19-20", "G-27-28", "G-28-29")) %>% group_by(plotting, likely_category) %>% tally() %>%
+  ggplot()+
+  geom_col(aes(x = n, y = plotting, fill = likely_category), position = "fill")+
+  scale_fill_brewer(palette = "BrBG", direction = -1, name = "Predicted category")+
+  theme_classic(base_size = 16)+
+  xlab("Proportion of specimens")+
+  ylab("Submember")+
+  annotate(geom = "text", x = 1.03, y = as.vector(1:(length(subset_samples))), label = subset_samples, hjust = 0.2, size = 4)+
+  theme(legend.position = "bottom")
+
+submember_plot_clean_30pc
+```
+
+Predictions from 8 PC CVA:
+```{r, fig.width = 9, fig.height = 9}
+# reorder factor levels so that the submembers are in chronological order from oldest to youngest
+fossil_scores_info_8pc$Submember <- as.factor(fossil_scores_info_8pc$Submember)
+levels(fossil_scores_info_8pc$Submember)
+fossil_scores_info_8pc$Submember <- factor(fossil_scores_info_8pc$Submember, levels = c("G-1","G-2","G-3","G-4","G-5","G-6","G-7","G-8","G-9","G-10","G-11","G-12","G-13","G-15","G-19","G-24","G-27","G-28"))
+
+fossil_scores_info_8pc$Submember_2 <- as.factor(fossil_scores_info_8pc$Submember_2)
+levels(fossil_scores_info_8pc$Submember_2)
+fossil_scores_info_8pc$Submember_2 <- factor(fossil_scores_info_8pc$Submember_2, levels = c("G-1", "G-1-5", "G-1-9", "G-1-13", "G-3", "G-3-8", "G-3-13", "G-4", "G-4-13", "G-5", "G-6", "G-6-8", "G-7", "G-7-8", "G-8", "G-8-9", "G-9", "G-10-11", "G-11", "G-12", "G-12-13", "G-13", "G-15", "G-15-29", "G-19", "G-19-20", "G-24", "G-27", "G-27-28", "G-28-29"))
+
+# only n > 2 and combining some groups (adjacent sub-members) 
+fossil_scores_info_8pc$plotting <- NA
+fossil_scores_info_8pc$plotting <- fossil_scores_info_8pc$Submember_2
+fossil_scores_info_8pc[fossil_scores_info_8pc$plotting %in% c("G-27", "G-27-28"),]$plotting <- "G-27-28"
+fossil_scores_info_8pc[fossil_scores_info_8pc$plotting %in% c("G-19", "G-19-20"),]$plotting <- "G-19-20"
+fossil_scores_info_8pc[fossil_scores_info_8pc$plotting %in% c("G-10-11", "G-11"),]$plotting <- "G-10-11"
+fossil_scores_info_8pc[fossil_scores_info_8pc$plotting %in% c("G-8-9", "G-9"),]$plotting <- "G-8-9"
+
+# chi-squared
+subset_8pc <- fossil_scores_info_8pc %>% filter(plotting %in% c("G-3", "G-4", "G-5", "G-7", "G-8", "G-8-9", "G-10-11", "G-12", "G-12-13", "G-13", "G-19-20", "G-27-28", "G-28-29")) 
+subset_8pc$plotting <- factor(subset_8pc$plotting, levels = c("G-3", "G-4", "G-5", "G-7", "G-8", "G-8-9", "G-10-11", "G-12", "G-12-13", "G-13", "G-19-20", "G-27-28", "G-28-29"))
+subset_8pc <- table(subset_8pc$plotting, subset_8pc$likely_category)
+set.seed(1212)
+chisq.test(subset_8pc, simulate.p.value = T)
+
+# plot
+submember_plot_clean_8pc <- fossil_scores_info_8pc %>% filter(plotting %in% c("G-3", "G-4", "G-5", "G-7", "G-8", "G-8-9", "G-10-11", "G-12", "G-12-13", "G-13", "G-19-20", "G-27-28", "G-28-29")) %>% group_by(plotting, likely_category) %>% tally() %>%
+  ggplot()+
+  geom_col(aes(x = n, y = plotting, fill = likely_category), position = "fill")+
+  scale_fill_brewer(palette = "BrBG", direction = -1, name = "Predicted category")+
+  theme_classic(base_size = 16)+
+  xlab("Proportion of specimens")+
+  ylab("Submember")+
+  annotate(geom = "text", x = 1.03, y = as.vector(1:(length(subset_samples))), label = subset_samples, hjust = 0.2, size = 4)+
+  theme(legend.position = "bottom")
+
+submember_plot_clean_8pc
+```
+
+Combine 30PC and 8PC CVA plots:
+```{r fig.height=9, fig.width=25}
+(submember_plot_clean_30pc | submember_plot_clean_8pc) + plot_layout(axis_titles = "collect", axes = "collect_y", guides = "collect") & theme(legend.position = "bottom") 
+```
