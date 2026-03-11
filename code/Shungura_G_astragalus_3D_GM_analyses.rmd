@@ -475,6 +475,33 @@ cva_1v2
 cva_1v3
 ```
 
+##### PCA and CVA minus Kobus ellipsiprymnus 
+```{r}
+# which rows in the data are waterbuck
+waterbuck <- which(modern_astragali_info$Genus_species == "Kobus_ellipsiprymnus")
+
+# modern gpa coordinates
+modern_gpa_coords <- GPA_all$coords[,,1:136]
+
+# subset landmarks without waterbuck
+PCA_2 <- gm.prcomp(modern_gpa_coords[,,-waterbuck])
+summary(PCA_2)
+
+# create matrix of PC scores
+mod_PC_scores_2 <- PCA_2[["x"]]
+modern_PC_scores_scaled_2 <- apply(mod_PC_scores_2, 2, min_max) # apply the scaling function to each column of the dataset
+
+# run CVA on those scores
+cvaresults_scaled_CV_2 <- lda(modern_PC_scores_scaled_2, cvagroups[-waterbuck], CV=TRUE)
+crossval_2 <- table(cvagroups[-waterbuck], cvaresults_scaled_CV_2$class) # confusion matrix of specimen assignments
+sum(diag(prop.table(crossval_2))) # total percent correct
+
+# Supplementary Table 6
+altcrossval_2 <- rbind(crossval_2[1,]/sum(crossval_2[1,]), crossval_2[2,]/sum(crossval_2[2,]), crossval_2[3,]/sum(crossval_2[3,]), crossval_2[4,]/sum(crossval_2[4,]))
+dimnames(altcrossval_2) <- list("Actual"=c("F", "HC", "LC", "O"), "Predicted (CV)"=c("F", "HC", "LC", "O"))
+print(round(altcrossval_2, 3))
+
+```
 
 #### CVA with first 30 PCs:
 
@@ -496,7 +523,7 @@ C_30pc_info <- data.frame(CV1 = C_30pc[,1],
                      Tribe = modern_astragali_info$Tribe)
 ```
 
-##### Leave-one-out cross-validation (Supplementary Table 6)
+##### Leave-one-out cross-validation (Supplementary Table 7)
 
 ```{r}
 cvaresults_30pc_CV <- lda(modern_PC_scores_scaled[,1:30], cvagroups, CV=TRUE)
@@ -514,7 +541,7 @@ print(round(altcrossval_30pc, 3))
 ```{r}
 # conduct the CVA (without cross-validation):
 cvaresults_8pc <- lda(modern_PC_scores_scaled[,1:8], cvagroups, CV=FALSE)
-A_8pc <- cvaresults_8pc$scaling # Supplementary Table 7
+A_8pc <- cvaresults_8pc$scaling # Supplementary Table 8
 grpmeans_8pc <- cvaresults_8pc$means
 
 # project specimens onto CVA
@@ -528,7 +555,7 @@ C_8pc_info <- data.frame(CV1 = C_8pc[,1],
                      Tribe = modern_astragali_info$Tribe)
 ```
 
-##### Leave-one-out cross-validation (Supplementary Table 8)
+##### Leave-one-out cross-validation (Supplementary Table 9)
 ```{r}
 cvaresults_8pc_CV <- lda(modern_PC_scores_scaled[,1:8], cvagroups, CV=TRUE)
 crossval_8pc <- table(cvagroups, cvaresults_8pc_CV$class) # confusion matrix of specimen assignments
